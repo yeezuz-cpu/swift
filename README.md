@@ -8,7 +8,7 @@ single-header direct syscall memory library with page caching for windows. made 
 
 bypasses ntdll and kernel32 entirely - generates raw syscall stubs at runtime with the correct SSN baked in. if ntdll is hooked (anti-cheat), falls back to halo's gate to resolve SSNs from neighboring unhooked stubs.
 
-the page cache is what makes it actually fast. on the first read swift-mem pulls an entire 4KB page into a local cache. every subsequent read on that same page is just a memcpy - no syscall, no kernel transition.
+the page cache is what makes it actually fast. 4-way set-associative cache that pulls entire 4KB pages. every subsequent read on a cached page is just a memcpy - no syscall, no kernel transition. adaptive prefetching detects sequential access and pulls ahead pages automatically.
 
 ## performance
 
@@ -33,9 +33,17 @@ header-only. grab `include/swift-mem.h` and drop it into your project.
 ### basic setup
 
 ```cpp
+// default: 256 slots, 4-way, prefetch 2 pages ahead
 if (!swift::init()) return 1;
-if (!swift::attach(L"game.exe")) return 1;
 
+// or configure the cache
+swift::cache_config cfg;
+cfg.slots = 1024;   // more slots = fewer collisions
+cfg.ways  = 4;      // 4-way set-associative
+cfg.prefetch_ahead = 2;
+if (!swift::init(cfg)) return 1;
+
+if (!swift::attach(L"game.exe")) return 1;
 uintptr_t base = swift::get_module_base(L"game.exe");
 ```
 
@@ -53,11 +61,32 @@ float z = swift::read<float>(base + 0x138);
 // uncached - always syscalls, for volatile data
 int ammo = swift::read_volatile<int>(base + 0x200);
 
+// try_read - distinguish failed reads from valid zeros
+auto hp = swift::try_read<int>(base + 0x100);
+if (hp.ok) printf("health: %d\n", hp.value);
+
+// read arrays efficiently (uses cache, handles page boundaries)
+float matrix[16];
+swift::read_array<float>(view_matrix_addr, matrix, 16);
+
 // pointer chains
 uintptr_t player = swift::chain(base, {0x10, 0x20, 0x8});
 
 // read MSVC std::string from target (handles SSO)
 std::string name = swift::read_msvc_string(player + 0x70);
+```
+
+### writing
+
+```cpp
+swift::write<int>(base + 0x123, 100);
+// automatically invalidates the cache for that page
+
+// batch writes
+uintptr_t addrs[] = {addr1, addr2, addr3};
+const void* bufs[] = {&val1, &val2, &val3};
+size_t sizes[] = {sizeof(val1), sizeof(val2), sizeof(val3)};
+swift::write_batch(addrs, bufs, sizes, 3);
 ```
 
 ### page cache
@@ -75,27 +104,42 @@ while (running) {
 }
 ```
 
-### writing
+### multi-process
+
+for reading multiple processes, use `swift::context` directly:
 
 ```cpp
-swift::write<int>(base + 0x123, 100);
-// automatically invalidates the cache for that page
+swift::context game, overlay;
+game.init();
+overlay.init({.slots = 128, .ways = 2});
+
+game.attach(L"game.exe");
+overlay.attach(L"overlay.exe");
+
+int hp = game.read<int>(addr);
+// each context has its own cache, handle, syscall stubs
 ```
+
+the free functions (`swift::read`, `swift::attach` etc) are shortcuts that use a default global context. same API, just without the object.
 
 ### cleanup
 
 ```cpp
 swift::cleanup();
+// or let context destructor handle it (RAII)
 ```
 
 ## api
 
-- `init()` / `cleanup()` - setup and teardown
+- `init(cfg)` / `cleanup()` - setup and teardown (RAII supported)
 - `attach(name)` / `attach(pid)` - open target process
 - `detach()` - close handle
 - `read<T>(addr)` - cached read
+- `try_read<T>(addr)` - cached read with success/fail status
 - `read_volatile<T>(addr)` - uncached read
+- `read_array<T>(addr, out, count)` - read contiguous array
 - `write<T>(addr, val)` - write + cache invalidate
+- `write_batch(...)` - multiple writes
 - `read_raw` / `write_raw` - raw bytes
 - `read_string` / `read_msvc_string` - string helpers
 - `chain(base, {offsets})` - pointer chain
@@ -112,4 +156,5 @@ swift::cleanup();
 - handles hooked ntdll via halo's gate
 - hot path is `__forceinline`
 - windows 10 and 11
+- RAII - context cleans up on destruction, no leaks
 - more features and optimizations coming
