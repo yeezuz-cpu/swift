@@ -16,3 +16,8 @@ Debug/
 *.tlog
 *.idb
 *.ipch
+*.iobj
+*.ipdb
+*.recipe
+*.lastbuildstate
+*.vsidx
